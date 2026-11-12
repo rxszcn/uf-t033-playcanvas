@@ -297,6 +297,16 @@ class Asset extends EventHandler {
     _resources = [];
 
     /**
+     * Bumped by every {@link Asset#unload}. A load in flight captures the value it started with, so
+     * a callback from an unloaded generation can be told apart from one belonging to a later load
+     * and must not resurrect the asset it was unloaded from.
+     *
+     * @type {number}
+     * @ignore
+     */
+    _loadGeneration = 0;
+
+    /**
      * The asset id.
      *
      * @type {number}
@@ -765,6 +775,11 @@ class Asset extends EventHandler {
      * The `unload` event also fires while the asset is loading, allowing resource handlers to
      * cancel pending work.
      *
+     * A load still in flight (for example a file that has not finished downloading) cannot be
+     * cancelled at the network layer, but it is detached here: its late result never resurrects the
+     * asset, and any resource it allocates is released once the download completes. Loading the
+     * asset again afterwards starts a fresh load.
+     *
      * @example
      * const asset = app.assets.find("My Asset");
      * asset.unload();
@@ -774,6 +789,10 @@ class Asset extends EventHandler {
         if (!this.loaded && !this.loading && this._resources.length === 0) {
             return;
         }
+
+        // invalidate any load in flight before its callbacks can run, so a late completion cannot
+        // reassign the resource below once it has been cleared
+        this._loadGeneration++;
 
         this.fire('unload', this);
         this.registry?.fire(`unload:${this.id}`, this);
@@ -788,11 +807,19 @@ class Asset extends EventHandler {
         // clear resources on the asset
         this.resources = [];
         this.loaded = false;
+        // the in-flight download no longer owns this asset; resetting loading also lets a
+        // subsequent load() start a fresh request
+        this.loading = false;
         this.loadFromUrlError = null;
 
-        // remove resource from loader cache
+        // detach any in-flight loader request and remove resource from loader cache
         if (this.file) {
-            this.registry?._loader.clearCache(this.getFileUrl(), this.type);
+            const loader = this.registry?._loader;
+            const fileUrl = this.getFileUrl();
+            if (loader && fileUrl) {
+                loader.unsubscribe?.(fileUrl, this.type, this);
+                loader.clearCache(fileUrl, this.type);
+            }
         }
 
         // destroy resources

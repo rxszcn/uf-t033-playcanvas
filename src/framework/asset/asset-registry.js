@@ -469,6 +469,10 @@ class AssetRegistry extends EventHandler {
 
         const file = asset.file;
 
+        // the generation this load belongs to. unload() bumps it, so a completion callback from a
+        // load in flight at unload time is stale and must not touch the asset
+        const loadGeneration = asset._loadGeneration;
+
         const _fireLoad = () => {
             this.fire('load', asset);
             this.fire(`load:${asset.id}`, asset);
@@ -508,7 +512,13 @@ class AssetRegistry extends EventHandler {
                         this.fire(`load:start:url:${file.url}`, asset);
                     }
                     asset.fire('load:start', asset);
-                    bundle.on('load', _fireLoad);
+                    // the Bundle finishes loading after open() completed; an unload in that window
+                    // must not let this stale listener fire load onto a newer generation
+                    bundle.on('load', () => {
+                        if (asset._loadGeneration === loadGeneration) {
+                            _fireLoad();
+                        }
+                    });
                 }
             } else {
                 _fireLoad();
@@ -517,6 +527,48 @@ class AssetRegistry extends EventHandler {
 
         // load has completed on the resource
         const _loaded = (err, resource, extra) => {
+            if (asset._loadGeneration !== loadGeneration) {
+                // the asset was unloaded while this request was in flight. A late result must never
+                // put a real resource (which handler.open() just allocated, often on the GPU) back
+                // onto the unloaded asset, so it is released here. The file-backed loader has
+                // already detached the request and done the same for the no-subscriber case; this
+                // guard covers the file-less loads (cubemap faces, container-backed renders) too.
+                asset.loading = false;
+
+                if (err) {
+                    // an unloaded asset reports neither the load nor the failure of the request it
+                    // no longer cares about
+                    return;
+                }
+
+                const isCancellation = resource === null ||
+                    (resource instanceof Array && resource.length === 0);
+                if (!isCancellation) {
+                    // a real resource arrived after the unload: destroy it instead of resurrecting
+                    // the asset
+                    if (resource instanceof Array) {
+                        for (let i = 0; i < resource.length; i++) {
+                            resource[i]?.destroy?.();
+                        }
+                    } else {
+                        resource?.destroy?.();
+                    }
+                    return;
+                }
+
+                // a handler that tracks unload itself (for example the gsplat parsers) completes the
+                // cancelled load with a null resource. Settle the load on the same null resource
+                // rather than leaving the asset's listeners waiting forever; loaded stays false
+                // because nothing was actually loaded, and no patch or cache entry is created.
+                if (resource instanceof Array) {
+                    asset.resources = resource;
+                } else {
+                    asset.resource = resource;
+                }
+                _fireLoad();
+                return;
+            }
+
             asset.loaded = true;
             asset.loading = false;
 

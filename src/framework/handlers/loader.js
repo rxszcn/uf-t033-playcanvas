@@ -19,6 +19,74 @@ import { http } from '../../platform/net/http.js';
  */
 
 /**
+ * A single in-flight {@link ResourceLoader#load} request and everything waiting on it. The same
+ * URL and type share one request, so an entry can hold several (callback, asset) subscribers. An
+ * asset unloaded mid-download marks its subscribers inactive rather than deleting them: this keeps
+ * the callbacks reachable for a handler's cancellation signal (a null resource that must still
+ * settle the load), while letting a real late result recognise that nobody owns it anymore.
+ *
+ * @ignore
+ */
+class PendingRequest {
+    /**
+     * @type {ResourceLoaderCallback[]}
+     */
+    callbacks = [];
+
+    /**
+     * The asset each callback at the same index was registered for. A null entry marks a
+     * subscriber that supplied no asset (a direct ResourceLoader#load call), which can never
+     * unsubscribe and therefore always stays active.
+     *
+     * @type {(Asset|null)[]}
+     */
+    assets = [];
+
+    /**
+     * Whether the callback at the same index still waits on the request. Entries belonging to an
+     * asset that unloaded mid-download are flipped to false but retained.
+     *
+     * @type {boolean[]}
+     */
+    active = [];
+
+    /**
+     * @param {ResourceLoaderCallback} callback - The callback waiting on the request.
+     * @param {Asset} [asset] - The asset that initiated the request, if any.
+     */
+    add(callback, asset) {
+        this.callbacks.push(callback);
+        this.assets.push(asset ?? null);
+        this.active.push(true);
+    }
+
+    /**
+     * Deactivate every subscriber registered for the given asset. Its callback is retained so a
+     * null cancellation result can still reach it, but it no longer counts as an owner of a real
+     * result.
+     *
+     * @param {Asset} asset - The asset that unsubscribed.
+     */
+    remove(asset) {
+        for (let i = 0; i < this.assets.length; i++) {
+            if (this.assets[i] === asset) {
+                this.active[i] = false;
+            }
+        }
+    }
+
+    /**
+     * Whether any active subscriber still waits on this request. Subscribers without an asset
+     * cannot be removed, so they always count.
+     *
+     * @returns {boolean} True if at least one active subscriber remains.
+     */
+    hasSubscribers() {
+        return this.active.some(entry => entry);
+    }
+}
+
+/**
  * The ResourceLoader turns a URL and an asset type into a loaded resource. It owns one
  * {@link ResourceHandler} per type, dispatches each request to the matching handler, and caches the
  * result by URL and type so the same request is fetched once. Each application has one at
@@ -48,6 +116,9 @@ class ResourceLoader {
      */
     constructor(app) {
         this._handlers = {};
+        // each in-flight request is an entry holding the callbacks waiting on it and the assets
+        // that initiated them, so an asset unloaded mid-download can unsubscribe and leave a late
+        // result without a live owner un-cached and destroyed
         this._requests = {};
         this._cache = {};
         this._app = app;
@@ -144,10 +215,12 @@ class ResourceLoader {
             callback(null, this._cache[key]);
         } else if (this._requests[key]) {
             // existing request
-            this._requests[key].push(callback);
+            this._requests[key].add(callback, asset);
         } else {
             // new request
-            this._requests[key] = [callback];
+            const entry = new PendingRequest();
+            entry.add(callback, asset);
+            this._requests[key] = entry;
 
             const self = this;
 
@@ -159,12 +232,20 @@ class ResourceLoader {
 
                 if (urlObj.load instanceof DataView) {
                     if (handler.openBinary) {
-                        if (!self._requests[key]) {
+                        const request = self._requests[key];
+                        if (!request) {
                             return;
                         }
 
                         try {
                             const data = handler.openBinary(urlObj.load);
+                            // the download outlived every active subscriber: keep its result out of
+                            // the cache so it cannot be handed out as an ownerless resource later
+                            if (!request.hasSubscribers()) {
+                                delete self._requests[key];
+                                data?.destroy?.();
+                                return;
+                            }
                             self._onSuccess(key, data);
                         } catch (err) {
                             self._onFailure(key, err);
@@ -184,7 +265,8 @@ class ResourceLoader {
                 handler.load(urlObj, (err, data, extra) => {
                     // make sure key exists because loader
                     // might have been destroyed by now
-                    if (!self._requests[key]) {
+                    const request = self._requests[key];
+                    if (!request) {
                         return;
                     }
 
@@ -193,11 +275,41 @@ class ResourceLoader {
                         return;
                     }
 
+                    let resource;
                     try {
-                        self._onSuccess(key, handler.open(urlObj.original, data, asset), extra);
+                        resource = handler.open(urlObj.original, data, asset);
                     } catch (e) {
                         self._onFailure(key, e);
+                        return;
                     }
+
+                    if (!request.hasSubscribers()) {
+                        // every asset waiting on this request was unloaded before it finished. A null
+                        // resource is the handler's cancellation signal (it tracked the unload and
+                        // settled the load itself): deliver it to the retained callbacks so the
+                        // unloaded asset's listeners resolve rather than hanging. Anything else is an
+                        // orphaned late result allocated after the unload with no owner, so keep it out
+                        // of the cache and release it (the GPU memory leak behind assets resurrecting
+                        // on a late download).
+                        if (resource === null) {
+                            const { callbacks } = request;
+                            delete self._requests[key];
+                            for (let i = 0; i < callbacks.length; i++) {
+                                callbacks[i](null, null, extra);
+                            }
+                            return;
+                        }
+
+                        delete self._requests[key];
+                        resource?.destroy?.();
+                        if (urlObj.load && urlObj.load.startsWith('blob:') && asset?.urlObject === urlObj.load) {
+                            URL.revokeObjectURL(urlObj.load);
+                            asset.urlObject = null;
+                        }
+                        return;
+                    }
+
+                    self._onSuccess(key, resource, extra);
                 }, asset);
             };
 
@@ -255,26 +367,50 @@ class ResourceLoader {
     }
 
     _onSuccess(key, result, extra) {
+        const request = this._requests[key];
+        if (!request) {
+            return;
+        }
+
         if (result !== null) {
             this._cache[key] = result;
         } else {
             delete this._cache[key];
         }
-        for (let i = 0; i < this._requests[key].length; i++) {
-            this._requests[key][i](null, result, extra);
-        }
+
+        const { callbacks, active } = request;
         delete this._requests[key];
+        // only active subscribers receive a real result; inactive ones unloaded and must not be
+        // resurrected by a late completion
+        for (let i = 0; i < callbacks.length; i++) {
+            if (active[i]) {
+                callbacks[i](null, result, extra);
+            }
+        }
     }
 
     _onFailure(key, err) {
-        // include a string-form message so external error reporters (which often JSON.stringify the
-        // arguments) get useful context, while keeping the original Error available for dev tools
-        console.error(`Failed to load resource [${key}]: ${err?.message ?? err}`, err);
-        if (this._requests[key]) {
-            for (let i = 0; i < this._requests[key].length; i++) {
-                this._requests[key][i](err);
+        const request = this._requests[key];
+        if (!request) {
+            return;
+        }
+
+        const { callbacks, active } = request;
+        const hasActive = active.some(entry => entry);
+
+        // a request whose every subscriber unloaded fails into nothing: stay quiet rather than
+        // reporting an error nobody handles
+        if (hasActive) {
+            // include a string-form message so external error reporters (which often JSON.stringify the
+            // arguments) get useful context, while keeping the original Error available for dev tools
+            console.error(`Failed to load resource [${key}]: ${err?.message ?? err}`, err);
+        }
+
+        delete this._requests[key];
+        for (let i = 0; i < callbacks.length; i++) {
+            if (active[i]) {
+                callbacks[i](err);
             }
-            delete this._requests[key];
         }
     }
 
@@ -325,6 +461,23 @@ class ResourceLoader {
     clearCache(url, type) {
         const key = ResourceLoader.makeKey(url, type);
         delete this._cache[key];
+    }
+
+    /**
+     * Unsubscribe an asset from an in-flight request. Called when the asset is unloaded while its
+     * file is still downloading: the download itself cannot be cancelled at the HTTP layer, but the
+     * request stops delivering its result to this asset, and once it has no subscribers left its
+     * late result is discarded and destroyed instead of being cached behind an owner that no longer
+     * exists. Has no effect when the request has already completed or was never started.
+     *
+     * @param {string} url - The URL of the resource the asset was loading.
+     * @param {string} type - The type of resource.
+     * @param {Asset} asset - The asset that no longer waits for the request.
+     * @ignore
+     */
+    unsubscribe(url, type, asset) {
+        const key = ResourceLoader.makeKey(url, type);
+        this._requests[key]?.remove(asset);
     }
 
     /**
